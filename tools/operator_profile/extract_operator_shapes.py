@@ -8,6 +8,7 @@ import csv
 import gzip
 import json
 import re
+import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from decimal import ROUND_HALF_UP, Decimal
@@ -28,6 +29,7 @@ if __package__:
         operator_descriptor,
         staged_kernel_family_name,
     )
+    from .run_provenance import read_run_provenance
 else:
     from eager_reference import (
         DETAIL_REFERENCE_FIELDS,
@@ -42,6 +44,7 @@ else:
         operator_descriptor,
         staged_kernel_family_name,
     )
+    from run_provenance import read_run_provenance
 
 GPU_CATEGORIES = {"kernel", "gpu_memcpy", "gpu_memset"}
 MetadataKey = tuple[str, str | None, str | None, str]
@@ -928,14 +931,6 @@ def main() -> None:
     args = parser.parse_args()
     eager_index = None
     eager_summary = None
-    if args.eager_reference is not None:
-        if args.eager_reference.resolve() == args.output_dir.resolve():
-            raise ValueError("eager reference must differ from the output directory")
-        eager_index, eager_summary = load_eager_reference(
-            args.eager_reference, args.rank
-        )
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
     runtime_files = [
         file
         for file in runtime_trace_files(args.trace_dir)
@@ -946,7 +941,29 @@ def main() -> None:
             f"no rank-{args.rank} runtime profiler traces under {args.trace_dir}"
         )
 
+    try:
+        run_provenance = read_run_provenance(args.trace_dir, runtime_files)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.eager_reference is not None:
+        if args.eager_reference.resolve() == args.output_dir.resolve():
+            parser.error("eager reference must differ from the output directory")
+        try:
+            eager_index, eager_summary = load_eager_reference(
+                args.eager_reference, args.rank, run_provenance
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        if eager_summary["environment_validation"] == "unverified":
+            fields = ", ".join(eager_summary["unverified_fields"])
+            print(
+                f"warning: eager reference provenance unverified for {fields}",
+                file=sys.stderr,
+            )
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
     kernel_summary, kernel_report, summary = collect_runtime(runtime_files, args.rank)
+    summary["run_provenance"] = run_provenance
     failed_checks = [
         key
         for key, value in summary["conservation"].items()

@@ -19,9 +19,9 @@ hyphens with underscores and preserve meaningful version dots, for example
 
 ## Start a server
 
-`serve.sh` is a thin wrapper around `vllm serve`. It adds only the native torch
-profiler configuration and output-directory checks. Model selection and other
-vLLM arguments remain explicit command-line inputs.
+`serve.sh` wraps `vllm serve` with the native torch profiler configuration,
+output-directory checks, and launch provenance. Model selection and other vLLM
+arguments remain explicit command-line inputs.
 
 Qwen plugin graph example:
 
@@ -117,7 +117,7 @@ then parses rank 0. An output directory containing an existing trace is rejected
   reference, including merged direct/reference records; otherwise it is `null`.
   A `null` reference marker does not imply successful API attribution.
 - `kernel_shape_dtype.csv`: kernel/operator/shape/dtype mapping variants.
-- `summary.json`: trace scope, mapping coverage, and conservation checks.
+- `summary.json`: trace scope, run provenance, mapping coverage, and conservation checks.
 - `flaggems_enable_oplist.txt`: current plugin evidence, when generated.
 
 Missing operator attribution remains `null` unless a unique eager reference API
@@ -140,10 +140,32 @@ kernel events, shapes, calls, or time.
 
 Supply the results of an eager run from the same model, implementation
 (native or plugin), GPU platform, software versions, and relevant serving
-configuration. Only the execution mode should differ. Historical result files
-do not contain a complete environment manifest, so the caller must verify this
-condition; the extractor checks rank and runtime scope and records the source
-CSV checksum. It does not automatically select or verify an environment.
+configuration. The execution mode may differ.
+
+`serve.sh` records the model identifier or resolved local path, explicit
+`--revision` and tensor-parallel size, and the explicit `VLLM_PLUGINS` allowlist
+in `profile/run_provenance.json`. Use `VLLM_PLUGINS=""` for the native baseline.
+When copying a profile, keep this file in the directory passed as
+`--trace-dir`, or beside the trace if passing a single file.
+The extractor uses the device model when the selected Kineto traces report a
+consistent device model and writes the available fields to
+`summary.json.run_provenance`.
+
+The extractor checks rank and runtime scope, records the reference CSV
+checksum, and rejects any conflict between recorded provenance fields before
+writing results. The reference is `verified` for these fields when the model,
+plugin selection, device, and TP agree, and any revision recorded on either
+side agrees. Historical artifacts and runs with missing fields can still be
+used when the available fields agree. The extractor warns and records
+`environment_validation: "unverified"` and `unverified_fields` under
+`eager_reference` in their summary.
+
+An unset plugin allowlist, TP supplied only through a config file or default,
+and a trace without a consistent device model leave those fields unknown.
+Model URLs with credentials or query parameters also leave the model unknown.
+The caller still checks software versions, effective plugin loading, serving
+settings outside these fields, and the contents of a model at a mutable path
+or revision.
 
 For an existing graph trace:
 

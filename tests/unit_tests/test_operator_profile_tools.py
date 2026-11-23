@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import csv
 import gzip
 import importlib.util
 import json
@@ -88,7 +89,11 @@ def make_executable(path: Path, text: str) -> None:
     path.chmod(0o755)
 
 
-def test_serve_script_cleans_configured_flaggems_oplist(tmp_path):
+@pytest.mark.parametrize(
+    ("plugins", "expected"),
+    [("fl", ["fl"]), ("", []), (None, None)],
+)
+def test_serve_script_cleans_configured_flaggems_oplist(tmp_path, plugins, expected):
     run_dir = tmp_path / "run"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -103,9 +108,25 @@ def test_serve_script_cleans_configured_flaggems_oplist(tmp_path):
             "PATH": f"{fake_bin}:{env['PATH']}",
         }
     )
+    if plugins is None:
+        env.pop("VLLM_PLUGINS", None)
+    else:
+        env["VLLM_PLUGINS"] = plugins
 
     result = subprocess.run(
-        ["bash", str(SERVE_SCRIPT), "/model", "model", str(run_dir)],
+        [
+            "bash",
+            str(SERVE_SCRIPT),
+            "example/model",
+            "common-alias",
+            str(run_dir),
+            "--revision=example-revision",
+            "-tp",
+            "2",
+            "--api-key",
+            "test-key",
+            "--enforce-eager",
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -114,16 +135,34 @@ def test_serve_script_cleans_configured_flaggems_oplist(tmp_path):
 
     assert result.returncode == 0
     assert not oplist.exists()
+    provenance = json.loads((run_dir / "profile/run_provenance.json").read_text())
+    assert provenance.pop("vllm_plugins", None) == expected
+    assert provenance == {
+        "model": "example/model",
+        "model_revision": "example-revision",
+        "tensor_parallel_size": 2,
+    }
 
 
-def test_profile_script_moves_configured_flaggems_oplist(tmp_path):
+def test_profile_script_extracts_provenance_and_moves_configured_flaggems_oplist(
+    tmp_path,
+):
     run_dir = tmp_path / "run"
-    (run_dir / "profile").mkdir(parents=True)
-    (run_dir / "results").mkdir()
+    trace_dir = run_dir / "profile"
+    trace_dir.mkdir(parents=True)
+    (trace_dir / "run_provenance.json").write_text('{"model": "example/model"}')
+    trace = tmp_path / "rank0.pt.trace.json"
+    trace.write_text('{"traceEvents": [{"cat": "kernel", "name": "kernel", "dur": 1}]}')
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    make_executable(fake_bin / "curl", "#!/bin/sh\nexit 0\n")
-    make_executable(fake_bin / "python3", "#!/bin/sh\nexit 0\n")
+    make_executable(
+        fake_bin / "curl",
+        '#!/bin/sh\ncase "$*" in\n  */stop_profile) cp "$TEST_TRACE" "$TEST_TRACE_DIR/" ;;\nesac\n',
+    )
+    make_executable(
+        fake_bin / "python3",
+        '#!/bin/sh\ncase "$1" in\n  */extract_operator_shapes.py) exec "$TEST_PYTHON" "$@" ;;\nesac\n',
+    )
     oplist = tmp_path / "evidence/custom-oplist.txt"
     oplist.parent.mkdir()
     oplist.write_text("current", encoding="utf-8")
@@ -132,6 +171,9 @@ def test_profile_script_moves_configured_flaggems_oplist(tmp_path):
         {
             "FLAGGEMS_ENABLE_OPLIST_PATH": str(oplist),
             "PATH": f"{fake_bin}:{env['PATH']}",
+            "TEST_PYTHON": sys.executable,
+            "TEST_TRACE": str(trace),
+            "TEST_TRACE_DIR": str(trace_dir),
         }
     )
 
@@ -147,3 +189,118 @@ def test_profile_script_moves_configured_flaggems_oplist(tmp_path):
     assert result.returncode == 0
     assert copied.read_text(encoding="utf-8") == "current"
     assert not oplist.exists()
+    summary = json.loads((run_dir / "results/summary.json").read_text())
+    assert summary["run_provenance"] == {"model": "example/model", "device": None}
+
+
+@pytest.mark.parametrize(
+    "differences",
+    [
+        {},
+        {"model": "example/other-model"},
+        {"device": "AMD Instinct MI300X"},
+        {"vllm_plugins": [], "tensor_parallel_size": 4, "model_revision": "other"},
+        {"tensor_parallel_size": None},
+        {"device": None},
+        {"model": "example/other-model", "device": None},
+    ],
+)
+def test_extractor_compares_eager_run_provenance(tmp_path, differences):
+    provenance = {
+        "model": "example/model",
+        "model_revision": "example-revision",
+        "vllm_plugins": ["fl"],
+        "tensor_parallel_size": 2,
+        "device": "NVIDIA H100",
+    }
+
+    def extract(name, settings, events, reference=None):
+        trace_dir = tmp_path / name
+        trace_dir.mkdir()
+        settings = settings.copy()
+        device = settings.pop("device")
+        (trace_dir / "run_provenance.json").write_text(json.dumps(settings))
+        with gzip.open(
+            trace_dir / "rank0.pt.trace.json.gz", "wt", encoding="utf-8"
+        ) as target:
+            json.dump(
+                {"deviceProperties": [{"name": device}], "traceEvents": events}, target
+            )
+        output = tmp_path / f"{name}-results"
+        command = [
+            sys.executable,
+            str(EXTRACTOR_PATH),
+            "--trace-dir",
+            str(trace_dir),
+            "--output-dir",
+            str(output),
+        ]
+        if reference is not None:
+            command += ["--eager-reference", str(reference)]
+        return output, subprocess.run(
+            command, capture_output=True, text=True, check=False
+        )
+
+    eager, result = extract(
+        "eager",
+        provenance,
+        [
+            {"cat": "cpu_op", "name": "aten::mul", "args": {"External id": 1}},
+            {
+                "cat": "kernel",
+                "name": "shared_kernel",
+                "dur": 99,
+                "args": {"External id": 1},
+            },
+        ],
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        json.loads((eager / "summary.json").read_text())["run_provenance"] == provenance
+    )
+    graph, result = extract(
+        "graph",
+        {**provenance, **differences},
+        [
+            {"cat": "kernel", "name": "shared_kernel", "dur": 1},
+            {"cat": "kernel", "name": "shared_kernel", "dur": 2},
+        ],
+        eager,
+    )
+    conflicts = {
+        field: value for field, value in differences.items() if value is not None
+    }
+    if conflicts:
+        assert result.returncode != 0
+        assert not graph.exists()
+        assert "eager reference provenance mismatch" in result.stderr
+        for field, value in conflicts.items():
+            assert (
+                f"{field} (current={value!r}, eager={provenance[field]!r})"
+                in result.stderr
+            )
+        return
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((graph / "summary.json").read_text())
+    reference = summary["eager_reference"]
+    assert reference["environment_validation"] == (
+        "unverified" if differences else "verified"
+    )
+    assert reference["unverified_fields"] == list(differences)
+    assert ("warning: eager reference provenance unverified" in result.stderr) == bool(
+        differences
+    )
+    assert summary["kernel_event_count"] == 2
+    assert summary["kernel_time_total_us"] == 3
+    with (graph / "kernel_time.csv").open() as source:
+        assert list(csv.DictReader(source)) == [
+            {
+                "operator_name": "aten::mul",
+                "refer": "eager-refer",
+                "kernel_name": "shared_kernel",
+                "kernel_call_count": "2",
+                "kernel_time_us": "3.0",
+                "percent": "100.000%",
+            }
+        ]

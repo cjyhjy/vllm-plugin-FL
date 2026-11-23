@@ -9,6 +9,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .run_provenance import validate_run_provenance
+else:
+    from run_provenance import validate_run_provenance
+
 DETAIL_REFERENCE_FIELDS = [
     "eager_operator_name",
     "eager_input_shapes",
@@ -24,7 +29,7 @@ def encode(value: Any) -> str:
 
 
 def load_eager_reference(
-    results: Path, rank: int
+    results: Path, rank: int, run_provenance: dict[str, Any] | None = None
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
     """Read only direct eager observations, never chained reference columns."""
     summary_path = results / "summary.json"
@@ -41,6 +46,12 @@ def load_eager_reference(
     ]
     if failed:
         raise ValueError(f"eager reference conservation failed: {failed}")
+    reference_provenance = summary.get("run_provenance")
+    if reference_provenance is not None and not isinstance(reference_provenance, dict):
+        raise ValueError(f"run provenance must be a JSON object: {summary_path}")
+    validation = validate_run_provenance(
+        run_provenance or {}, reference_provenance or {}
+    )
 
     path = results / "kernel_shape_dtype.csv"
     content = path.read_bytes()
@@ -72,7 +83,7 @@ def load_eager_reference(
         "source": "eager-refer",
         "results_directory": str(results.resolve()),
         "kernel_shape_dtype_sha256": hashlib.sha256(content).hexdigest(),
-        "environment_validation": "caller_supplied_same_environment",
+        **validation,
         "rank": rank,
     }
 

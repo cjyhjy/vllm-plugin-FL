@@ -1075,3 +1075,10 @@ def test_extractor_eager_reference_preserves_graph_outputs(tmp_path):
     )
     assert summary["eager_reference"]["referenced_kernel_count"] == 1
     assert summary["eager_reference"]["events_with_reference_candidates"] == 1
+    assert summary["eager_reference"]["environment_validation"] == "unverified"
+    assert set(summary["eager_reference"]["unverified_fields"]) == {
+        "model",
+        "vllm_plugins",
+        "tensor_parallel_size",
+        "device",
+    }

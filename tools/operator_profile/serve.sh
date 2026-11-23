@@ -14,6 +14,7 @@ shift 3
 mkdir -p "$RUN_DIR"
 RUN_DIR=$(cd "$RUN_DIR" && pwd)
 PROFILE_DIR="$RUN_DIR/profile"
+TOOL_DIR=$(cd "$(dirname "$0")" && pwd)
 FLAGGEMS_OPLIST=${FLAGGEMS_ENABLE_OPLIST_PATH:-$RUN_DIR/flaggems_enable_oplist.txt}
 mkdir -p "$PROFILE_DIR"
 mkdir -p "$(dirname "$FLAGGEMS_OPLIST")"
@@ -28,6 +29,8 @@ fi
 # baseline from inheriting plugin evidence.
 rm -f "$FLAGGEMS_OPLIST"
 export FLAGGEMS_ENABLE_OPLIST_PATH="$FLAGGEMS_OPLIST"
+
+python3 "$TOOL_DIR/run_provenance.py" "$PROFILE_DIR" "$MODEL_PATH" "$@"
 
 printf -v PROFILER_CONFIG \
   '{"profiler":"torch","torch_profiler_dir":"%s","torch_profiler_record_shapes":true,"torch_profiler_with_stack":false,"torch_profiler_dump_cuda_time_total":false,"torch_profiler_with_memory":false,"ignore_frontend":true}' \
